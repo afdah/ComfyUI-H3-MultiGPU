@@ -118,6 +118,36 @@ def test_custom_split_ratios():
     print("Test clamp upper bound passed: clamped to 95/5")
 
 
+def test_capacity_fabric_fraction_45_55():
+    from h3vm.capacity_mode import CapacityFabric
+    import torch
+
+    if not torch.cuda.is_available():
+        print("CUDA not available, skipping fabric test")
+        return
+    dummy_mlp = torch.nn.Identity()
+    fabric = CapacityFabric(
+        primary="cuda:0",
+        secondary="cuda:0",
+        owner_map={i: 0 for i in range(50)},
+        helper_mlp_by_block={i: dummy_mlp for i in range(50)},
+        helper_attn_by_block={i: dummy_mlp for i in range(50)},
+        primary_fraction=0.45,
+        min_primary_fraction=0.45,
+        max_primary_fraction=0.45,
+    )
+    fabric.begin_step(1)
+    assert abs(fabric.primary_fraction - 0.45) < 1e-4, f"Expected 0.45, got {fabric.primary_fraction}"
+    for idx in range(50):
+        assert abs(fabric.block_primary_fraction[idx] - 0.45) < 1e-4
+    cut, frac = fabric._split(0, 48331)
+    assert abs(frac - 0.45) < 1e-4
+    assert cut == 21760  # round(48331 * 0.45 / 128) * 128 = 21760
+    assert (48331 - cut) == 26571
+    print("Test CapacityFabric 45/55 passed: cut=21760/26571 (45%/55%)")
+
+
 if __name__ == "__main__":
     test_custom_split_ratios()
+    test_capacity_fabric_fraction_45_55()
     print("ALL CUSTOM SPLIT TESTS PASSED!")

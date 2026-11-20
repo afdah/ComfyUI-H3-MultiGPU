@@ -146,6 +146,11 @@ class CapacityFabric(RollingCoverageMLPFabric):
         self._disabled_blocks.clear()
         self.active_blocks = set(self._all_indices)
         self._coverage_target = len(self._all_indices)
+        p_frac = min(0.95, max(0.05, float(kwargs.get("primary_fraction", 0.57))))
+        self.primary_fraction = p_frac
+        self.min_primary_fraction = p_frac
+        self.max_primary_fraction = p_frac
+        self.block_primary_fraction = {int(i): p_frac for i in self.active_blocks}
 
         self.helper_attn_by_block = dict(helper_attn_by_block or {})
         self.helper_packet_by_block = dict(helper_packet_by_block or {})

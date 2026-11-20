@@ -28,8 +28,9 @@ class RollingCoverageMLPFabric(CriticalPathMLPFabric):
         kwargs["adaptive_slack"] = True
         # Guard only. We reset every step to the same baseline fraction so the
         # matrix measures coverage rather than accumulating fraction tuning.
-        kwargs["min_primary_fraction"] = float(kwargs.get("primary_fraction", 0.68))
-        kwargs["max_primary_fraction"] = max(0.72, float(kwargs.get("primary_fraction", 0.68)))
+        p_frac = float(kwargs.get("primary_fraction", 0.68))
+        kwargs["min_primary_fraction"] = float(kwargs.get("min_primary_fraction", p_frac))
+        kwargs["max_primary_fraction"] = float(kwargs.get("max_primary_fraction", max(0.72, p_frac)))
         kwargs["fraction_step"] = 0.02
         kwargs["target_slack_ms"] = 9999.0  # never harvest deeper in this experiment
         kwargs["resident_sidecar_packet"] = False
