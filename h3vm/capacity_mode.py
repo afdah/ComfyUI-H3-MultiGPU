@@ -325,9 +325,9 @@ class CapacityFabric(RollingCoverageMLPFabric):
                     q, k, rope_freqs, qw, kw,
                     epsilon=eps, rot_dim=rot,
                 )
-            q = q[0].transpose(0, 1).unsqueeze(0)
-            k = k[0].transpose(0, 1).unsqueeze(0)
-            v = v.transpose(0, 1).unsqueeze(0)
+            q = q[0].transpose(0, 1).unsqueeze(0).contiguous()
+            k = k[0].transpose(0, 1).unsqueeze(0).contiguous()
+            v = v.transpose(0, 1).unsqueeze(0).contiguous()
             if self.attention_kernel == "OFFICIAL_OPTIMIZED":
                 # Same ComfyUI attention dispatcher used by official MiniMax H3.
                 # With --use-sage-attention this selects SageAttention; requesting
@@ -344,7 +344,13 @@ class CapacityFabric(RollingCoverageMLPFabric):
                     LOG.warning("H3VM Capacity: OFFICIAL_OPTIMIZED attention failed (%r); falling back to INT8", e)
             try:
                 packed = comfy_kitchen.prequantize_int8_attention(q, k, v, scale=None, attn_mask=None)
-                return comfy_kitchen.int8_attention_from_prequantized(packed)
+                out = comfy_kitchen.int8_attention_from_prequantized(packed)
+                cur_s = torch.cuda.current_stream(q.device)
+                for t in (getattr(packed, "q", None), getattr(packed, "k", None), getattr(packed, "v", None),
+                          getattr(packed, "q_scale", None), getattr(packed, "k_scale", None), getattr(packed, "v_scale", None)):
+                    if t is not None and isinstance(t, torch.Tensor):
+                        _safe_record_stream(t, cur_s)
+                return out
             except Exception as e:
                 LOG.warning("H3VM Capacity: comfy_kitchen INT8 attention failed (%r); falling back to optimized_attention", e)
                 from comfy.ldm.modules.attention import optimized_attention

@@ -197,12 +197,6 @@ class StreamingExactRuntime:
     def _trim_one(self, patcher, target_bytes: int, force_all: bool = False):
         if patcher is None:
             return 0, 0.0
-        fn = getattr(patcher, "partially_unload", None)
-        if not callable(fn):
-            if not self._warned_trim:
-                LOG.warning("H3VM Dev12 ModelPatcher lacks partially_unload(); hot-cache trimming disabled")
-                self._warned_trim = True
-            return 0, 0.0
         vbar_bytes = self._vbar_loaded_size(patcher)
         if vbar_bytes <= 0:
             return 0, 0.0
@@ -219,9 +213,21 @@ class StreamingExactRuntime:
         request = min(request, vbar_bytes)
         t0 = time.perf_counter()
         try:
-            freed = int(fn(patcher.offload_device, request) or 0)
+            get_vbar = getattr(patcher, "_vbar_get", None)
+            vbar = get_vbar() if callable(get_vbar) else None
+            if vbar is not None and hasattr(vbar, "free_memory"):
+                freed = int(vbar.free_memory(request) or 0)
+            else:
+                fn = getattr(patcher, "partially_unload", None)
+                if callable(fn):
+                    freed = int(fn(patcher.offload_device, request) or 0)
+                else:
+                    if not self._warned_trim:
+                        LOG.warning("H3VM Dev12 ModelPatcher lacks partially_unload(); hot-cache trimming disabled")
+                        self._warned_trim = True
+                    freed = 0
         except Exception as exc:
-            LOG.warning("H3VM Dev12 trim warning device=%s: %r", patcher.load_device, exc)
+            LOG.warning("H3VM Dev12 trim warning device=%s: %r", getattr(patcher, "load_device", None), exc)
             return 0, 0.0
         return freed, (time.perf_counter() - t0) * 1000.0
 
@@ -232,6 +238,14 @@ class StreamingExactRuntime:
         alone receives the configured hot-cache allowance; helper MLP weights are
         streamed for the current block and can be discarded immediately.
         """
+        import torch
+        dev = self.devices.get(owner)
+        if dev is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize(dev)
+            except Exception:
+                pass
+
         total_freed = 0
         total_ms = 0.0
         # Dev13.1 FEED: in single-root mode the secondary has no whole-block
@@ -666,6 +680,11 @@ class StreamingExactRuntime:
             with mm.cuda_device_context(dst):
                 h = block(h, t_emb_d, seg_d, rope_d, transformer_options=opts)
             torch.cuda.synchronize(dst)
+            if self.secondary_device is not None and self.secondary_device != dst:
+                try:
+                    torch.cuda.synchronize(self.secondary_device)
+                except Exception:
+                    pass
             if self.mlp_fabric is not None:
                 block_done = getattr(self.mlp_fabric, "on_block_complete", None)
                 if callable(block_done):

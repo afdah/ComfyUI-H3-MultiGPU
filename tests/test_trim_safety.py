@@ -17,6 +17,7 @@ class TestTrimSafety(unittest.TestCase):
         patcher = MagicMock()
         mock_vbar = MagicMock()
         mock_vbar.loaded_size.return_value = 500_000_000  # 500 MB resident
+        mock_vbar.free_memory.return_value = 500_000_000
         patcher._vbar_get.return_value = mock_vbar
         patcher.loaded_size.return_value = 500_000_000
         patcher.offload_device = "cpu"
@@ -26,8 +27,8 @@ class TestTrimSafety(unittest.TestCase):
         freed, dt = self.runtime._trim_one(patcher, target_bytes=0, force_all=True)
         self.assertEqual(freed, 500_000_000)
 
-        # Verify partially_unload received exactly 500_000_000, NOT 1e15
-        patcher.partially_unload.assert_called_once_with("cpu", 500_000_000)
+        # Verify free_memory received exactly 500_000_000, avoiding partially_unload backup restoration
+        mock_vbar.free_memory.assert_called_once_with(500_000_000)
 
     def test_trim_one_skips_when_empty(self):
         patcher = MagicMock()
@@ -39,7 +40,8 @@ class TestTrimSafety(unittest.TestCase):
 
         freed, dt = self.runtime._trim_one(patcher, target_bytes=0, force_all=True)
         self.assertEqual(freed, 0)
-        # Must not even call partially_unload when empty
+        # Must not even call free_memory or partially_unload when empty
+        mock_vbar.free_memory.assert_not_called()
         patcher.partially_unload.assert_not_called()
 
 

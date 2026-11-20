@@ -8,6 +8,18 @@ LOG = logging.getLogger("H3VM")
 MIB = 1024 ** 2
 
 
+def _safe_record_stream(tensor, stream):
+    if tensor is None:
+        return
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, message=".*original creation stream matches.*")
+            tensor.record_stream(stream)
+    except Exception:
+        pass
+
+
 def select_sidecar_blocks(total_blocks: int, count: int, start_block: int = 0):
     """Deterministically spread a fixed sidecar work package across the network.
 
@@ -265,6 +277,7 @@ class CriticalPathMLPFabric:
             d0.record(d2h)
             host.copy_(remote_x, non_blocking=self._pinned_available)
             d1.record(d2h)
+        _safe_record_stream(remote_x, d2h)
         # CPU waits only for the transfer runway.  The primary compute stream is
         # independent and keeps running during this wait.
         d1.synchronize()
@@ -275,6 +288,7 @@ class CriticalPathMLPFabric:
             remote.copy_(host, non_blocking=self._pinned_available)
             h1.record(h2d)
             ready.record(h2d)
+        _safe_record_stream(remote, h2d)
         return remote, ready, (d0, d1, h0, h1)
 
     def _return_to_owner(self, remote_out, owner, helper, helper_done):
@@ -295,6 +309,7 @@ class CriticalPathMLPFabric:
             d0.record(d2h)
             host.copy_(remote_out, non_blocking=self._pinned_available)
             d1.record(d2h)
+        _safe_record_stream(remote_out, d2h)
         # Again, only the sidecar transfer thread is waited on. GPU0 local MLP
         # continues on its own compute stream.
         d1.synchronize()
@@ -305,6 +320,7 @@ class CriticalPathMLPFabric:
             returned.copy_(host, non_blocking=self._pinned_available)
             h1.record(h2d)
             ready.record(h2d)
+        _safe_record_stream(returned, h2d)
         return returned, ready, (d0, d1, h0, h1)
 
     def execute(self, index: int, owner_mlp, x):
