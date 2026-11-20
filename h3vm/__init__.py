@@ -27,6 +27,9 @@ def activate_runtime() -> bool:
             return False
         _RUNTIME_ACTIVATING = True
         try:
+            import warnings
+            warnings.filterwarnings("ignore", category=UserWarning, message=".*Cannot dispatch to fused implementation.*")
+            warnings.filterwarnings("ignore", category=UserWarning, message=".*original creation stream matches.*")
             from .gpu_preflight import install_gpu_preflight_patch
             install_gpu_preflight_patch()
             from .comfy_kitchen_multigpu import install_comfy_kitchen_multigpu_dlpack_guard

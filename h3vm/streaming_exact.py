@@ -79,6 +79,8 @@ class StreamingExactRuntime:
                  critical_path_rolling_retire=False):
         self.primary_device = primary_device
         self.secondary_device = secondary_device
+        self.primary = primary_device
+        self.secondary = secondary_device
         self.devices = {0: primary_device, 1: secondary_device}
         self.blocks = dict(blocks)
         self.owner_map = dict(owner_map)
@@ -161,6 +163,26 @@ class StreamingExactRuntime:
                 pass
 
     @staticmethod
+    def _vbar_loaded_size(patcher):
+        if patcher is None:
+            return 0
+        get_vbar = getattr(patcher, "_vbar_get", None)
+        if callable(get_vbar):
+            try:
+                vbar = get_vbar()
+                if vbar is not None and hasattr(vbar, "loaded_size"):
+                    return int(vbar.loaded_size())
+            except Exception:
+                pass
+        fn = getattr(patcher, "loaded_size", None)
+        if callable(fn):
+            try:
+                return int(fn())
+            except Exception:
+                return 0
+        return 0
+
+    @staticmethod
     def _loaded_size(patcher):
         if patcher is None:
             return 0
@@ -181,12 +203,20 @@ class StreamingExactRuntime:
                 LOG.warning("H3VM Dev12 ModelPatcher lacks partially_unload(); hot-cache trimming disabled")
                 self._warned_trim = True
             return 0, 0.0
-        before = self._loaded_size(patcher)
-        request = max(0, before - int(target_bytes))
+        vbar_bytes = self._vbar_loaded_size(patcher)
+        if vbar_bytes <= 0:
+            return 0, 0.0
         if force_all:
-            request = max(request, int(1e15))
+            request = vbar_bytes
+        else:
+            request = max(0, vbar_bytes - int(target_bytes))
         if request <= 0:
             return 0, 0.0
+        # Crucial: never request more than vbar_bytes. If request > vbar_bytes,
+        # ComfyUI's partially_unload assumes VBAR fell short and falls back into
+        # restore_loaded_backups(), triggering an access violation / process abort
+        # on unmapped dynamic memory.
+        request = min(request, vbar_bytes)
         t0 = time.perf_counter()
         try:
             freed = int(fn(patcher.offload_device, request) or 0)
@@ -812,10 +842,25 @@ class StreamingExactRuntime:
                     LOG.info("H3VM DEV16 FINAL RESULT %s", json.dumps(final_summary(), ensure_ascii=False, separators=(",", ":")))
                 except Exception as exc:
                     LOG.warning("H3VM DEV16 final summary failed: %r", exc)
+        # Ensure CUDA operations on both devices are synchronized before unpinning/trimming
+        import torch
+        for dev in (getattr(self, "primary_device", None), getattr(self, "secondary_device", None)):
+            try:
+                if dev is not None and getattr(dev, "type", None) == "cuda":
+                    torch.cuda.synchronize(dev)
+            except Exception:
+                pass
+
         # The central RAM-first invariant: leave both block islands cold between
         # prompts so second Queue starts from essentially the same state.
-        self._trim_owner(0, force_all=True)
-        self._trim_owner(1, force_all=True)
+        try:
+            self._trim_owner(0, force_all=True)
+        except Exception as exc:
+            LOG.warning("H3VM Dev12 trim owner 0 warning: %r", exc)
+        try:
+            self._trim_owner(1, force_all=True)
+        except Exception as exc:
+            LOG.warning("H3VM Dev12 trim owner 1 warning: %r", exc)
         self._prepared = False
         self._step = 0
 

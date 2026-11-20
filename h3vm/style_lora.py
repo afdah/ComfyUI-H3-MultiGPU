@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import os
 
 
-NONE_LORA = "NONE｜不使用"
+NONE_LORA = "None"
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,7 @@ def normalize_style_lora_stack(stack) -> tuple[StyleLoRASpec, ...]:
             raise RuntimeError(f"Invalid H3VM style LoRA stack entry: {item!r}")
         name = str(spec.name).strip()
         strength = float(spec.strength)
-        if not name or name == NONE_LORA or abs(strength) < 1e-12:
+        if not name or name in (NONE_LORA, "None", "NONE") or abs(strength) < 1e-12:
             continue
         if is_acceleration_lora(name):
             raise RuntimeError(
@@ -95,6 +95,8 @@ def merge_weight_patch_state(target, patch_state: dict) -> int:
         bucket.extend(list(values))
         added += len(values)
     target.patches = current
+    from .precision import sanitize_patcher_precision
+    sanitize_patcher_precision(target)
     return int(added)
 
 

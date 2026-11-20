@@ -25,11 +25,16 @@ def test_public_surface_and_lazy_import():
 
 def test_public_controls():
     mod, _ = _load_plugin()
-    required = mod.H3VMCoreEngine.INPUT_TYPES()["required"]
-    assert required["gpu_mode"][0] == ("双卡极速", "双卡扩容", "双卡后台")
-    assert required["mode4_predictor"][0] == ("SPECTRAL｜频谱极速", "LINEAR｜标准极速")
-    assert required["gpu_participation"][0] == ("全｜100%", "高｜75%", "中｜50%", "低｜25%", "自定义")
+    types = mod.H3VMCoreEngine.INPUT_TYPES()
+    required = types["required"]
+    assert required["gpu_mode"][0] == ("Multi-GPU Fast", "Multi-GPU Capacity", "Multi-GPU Background")
+    assert required["mode4_predictor"][0] == ("SPECTRAL | Fast", "LINEAR | Standard")
+    assert required["gpu_participation"][0] == ("Full | 100%", "High | 75%", "Medium | 50%", "Low | 25%", "Custom")
     assert required["expected_steps_hint"][1]["default"] == 20
+    optional = types.get("optional", {})
+    assert "attention_kernel" in optional
+    assert "capacity_profile" in optional
+    assert "chunk_size" in optional
 
 
 def test_mode4_release_patch():

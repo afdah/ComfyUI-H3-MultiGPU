@@ -27,7 +27,7 @@ class H3VMCoreConfig:
     mode: str = "DUAL_QUIET"
     primary_device: str = "gpu:0"
     secondary_device: str = "gpu:1"
-    capacity_vram_profile: str = "SAFE｜保守·最稳"
+    capacity_vram_profile: str = "SAFE | Conservative Stable"
     expected_steps: int = 4
     telemetry: bool = True
     capacity_mlp_chunk_rows: int = 4096
@@ -35,6 +35,7 @@ class H3VMCoreConfig:
     capacity_attention_kernel: str = "INT8_CURRENT"
     secondary_participation: float = 100.0
     public_controls: bool = False
+    custom_split_primary: int = 57
 
 
 def _normalize_mode(mode: str) -> str:
@@ -42,7 +43,7 @@ def _normalize_mode(mode: str) -> str:
     return normalize_mode(mode)
 
 
-def _capacity_vram_plan(profile: str, primary_device: str, secondary_device: str) -> dict:
+def _capacity_vram_plan(profile: str, primary_device: str, secondary_device: str, custom_split_primary: int = 57) -> dict:
     import torch
     from .loader import _resolve_device
     from .master_console import resolve_capacity_vram_profile
@@ -51,7 +52,7 @@ def _capacity_vram_plan(profile: str, primary_device: str, secondary_device: str
     secondary = _resolve_device(secondary_device)
     pgib = float(torch.cuda.get_device_properties(primary).total_memory) / float(1024 ** 3)
     sgib = float(torch.cuda.get_device_properties(secondary).total_memory) / float(1024 ** 3)
-    return resolve_capacity_vram_profile(str(profile), pgib, sgib)
+    return resolve_capacity_vram_profile(str(profile), pgib, sgib, custom_split_primary=custom_split_primary)
 
 
 def execution_kwargs(config: H3VMCoreConfig) -> dict:
@@ -115,14 +116,28 @@ def execution_kwargs(config: H3VMCoreConfig) -> dict:
     if mode != "DUAL_CAPACITY":
         raise ValueError(f"Unknown H3VM mode: {mode}")
 
-    capacity_profile = str(config.capacity_vram_profile)
-    if bool(getattr(config, "public_controls", False)):
+    capacity_profile = str(config.capacity_vram_profile).strip()
+    if not capacity_profile or capacity_profile == "Auto":
+        import torch
+        from .loader import _resolve_device
         from .master_console import capacity_profile_for_participation
+        primary = _resolve_device(config.primary_device)
+        secondary = _resolve_device(config.secondary_device)
+        try:
+            pgib = float(torch.cuda.get_device_properties(primary).total_memory) / float(1024 ** 3)
+            sgib = float(torch.cuda.get_device_properties(secondary).total_memory) / float(1024 ** 3)
+        except Exception:
+            pgib, sgib = None, None
         capacity_profile = capacity_profile_for_participation(
-            float(getattr(config, "secondary_participation", 100.0))
+            float(getattr(config, "secondary_participation", 100.0)),
+            pgib,
+            sgib,
         )
     plan = _capacity_vram_plan(
-        capacity_profile, config.primary_device, config.secondary_device
+        capacity_profile,
+        config.primary_device,
+        config.secondary_device,
+        custom_split_primary=getattr(config, "custom_split_primary", 57),
     )
     mlp_fraction = float(plan["mlp_primary_fraction"])
     helper_heads = int(plan["capacity_helper_heads"])
@@ -176,7 +191,7 @@ def _common_builder_kwargs(config: H3VMCoreConfig) -> dict:
         stripe_size=50,
         expected_steps=max(1, int(config.expected_steps)),
         safe_profile=True,
-        hard_cleanup_after_sample=False,
+        hard_cleanup_after_sample=True,
         telemetry=bool(config.telemetry),
     )
 
@@ -202,7 +217,10 @@ def _unsupported_prebuilt_state(model) -> list[str]:
 
 
 def _copy_weight_patch_state(source, target) -> int:
+    from .precision import sanitize_patcher_precision
+    sanitize_patcher_precision(source)
     patches=getattr(source,"patches",{}) or {}; target.patches={key:list(values) for key,values in patches.items()}
+    sanitize_patcher_precision(target)
     if hasattr(source,"patches_uuid"): target.patches_uuid=source.patches_uuid
     if hasattr(source,"force_cast_weights"): target.force_cast_weights=source.force_cast_weights
     return sum(len(v) for v in target.patches.values())
@@ -244,7 +262,10 @@ def adapt_model(model, *, config: H3VMCoreConfig):
     if getattr(model,"cached_patcher_init",None) is None: raise RuntimeError("This MODEL cannot be safely deep-cloned for H3VM because its loader did not register cached_patcher_init. Use a core ComfyUI UNET/Checkpoint loader or compatible custom loader.")
     primary=_resolve_device(config.primary_device); private=model.deepclone_multigpu(new_load_device=primary); private.offload_device=torch.device("cpu")
     if hasattr(private,"remove_additional_models"): private.remove_additional_models("multigpu")
-    _validate_h3(private); patch_count=sum(len(v) for v in getattr(private,"patches",{}).values())
+    _validate_h3(private)
+    from .precision import sanitize_model_precision
+    sanitize_model_precision(private, device=primary)
+    patch_count=sum(len(v) for v in getattr(private,"patches",{}).values())
     print(f"[H3VM CORE] prebuilt MODEL path | mode={mode} | weight_patch_entries={patch_count} | private deepclone=yes",flush=True)
     with _CORE_BUILD_LOCK:
         with _prebuilt_streaming_bridge(private):

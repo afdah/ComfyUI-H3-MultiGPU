@@ -1946,6 +1946,26 @@ def build_h3_streaming_exact_turbo(*, unet_name: str, turbo_lora_name: str, turb
         p.size = 0
         p.cached_patcher_init = None
 
+    for p in (primary_island_patcher, secondary_island_patcher,
+              primary_mlp_helper_patcher, secondary_mlp_helper_patcher):
+        if p is None:
+            continue
+        orig_restore = getattr(p, "restore_loaded_backups", None)
+        if callable(orig_restore):
+            def _bind_safe_restore(patcher_obj, orig_fn):
+                def _safe_restore(*args, **kwargs):
+                    try:
+                        # Island patchers are ephemeral VBAR streaming views;
+                        # only invoke original restore if backup containers are non-empty
+                        if not getattr(patcher_obj, "backup", None) and not getattr(patcher_obj, "backup_buffers", None):
+                            return 0
+                        return orig_fn(*args, **kwargs)
+                    except BaseException as exc:
+                        LOG.warning("H3VM island patcher restore_loaded_backups suppressed: %r", exc)
+                        return 0
+                return _safe_restore
+            p.restore_loaded_backups = _bind_safe_restore(p, orig_restore)
+
     from .turbo_compat import apply_turbo_plan_to_streaming_islands
     turbo_counts = apply_turbo_plan_to_streaming_islands(
         plan=turbo_plan,

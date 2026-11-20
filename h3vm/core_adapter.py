@@ -28,15 +28,16 @@ class H3VMCoreConfig:
     mode: str = "DUAL_QUIET"
     primary_device: str = "gpu:0"
     secondary_device: str = "gpu:1"
-    capacity_vram_profile: str = "SAFE｜保守·最稳"
+    capacity_vram_profile: str = "SAFE | Conservative Stable"
     expected_steps: int = 4
     telemetry: bool = True
     capacity_mlp_chunk_rows: int = 4096
     capacity_outproj_chunk_rows: int = 4096
     capacity_attention_kernel: str = "INT8_CURRENT"
-    mode4_predictor: str = "LINEAR｜标准稳定"
+    mode4_predictor: str = "LINEAR | Standard"
     secondary_participation: float = 100.0
     public_controls: bool = False
+    custom_split_primary: int = 57
 
 
 def _normalize_mode(mode):
@@ -57,6 +58,7 @@ def _base_config(config):
         capacity_attention_kernel=str(config.capacity_attention_kernel),
         secondary_participation=float(getattr(config, "secondary_participation", 100.0)),
         public_controls=bool(getattr(config, "public_controls", False)),
+        custom_split_primary=int(getattr(config, "custom_split_primary", 57)),
     )
 
 
@@ -139,7 +141,7 @@ def _mode4_fullthrottle_host_policy():
 
 
 def _choice_key(value):
-    return str(value).strip().split("｜", 1)[0].strip().lower()
+    return str(value).strip().replace("｜", "|").split("|", 1)[0].strip().lower()
 
 
 def _mode4_predictor_config(config):
@@ -247,9 +249,12 @@ def build_asset_model(*, unet_name, turbo_lora_name, turbo_strength=1.0,
 
 
 def _filtered_copy(source, target):
+    from .precision import sanitize_patcher_precision
     from .style_lora import merge_weight_patch_state
+    sanitize_patcher_precision(source)
     target.patches = {}
     count = merge_weight_patch_state(target, getattr(source, "patches", {}) or {})
+    sanitize_patcher_precision(target)
     if hasattr(source, "patches_uuid"):
         target.patches_uuid = source.patches_uuid
     if hasattr(source, "force_cast_weights"):

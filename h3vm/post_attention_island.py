@@ -69,6 +69,19 @@ def build_post_attention_helper_maps(blocks, owner_map, helper_indices):
     return primary_helpers, secondary_helpers, helper_mlp_by_block
 
 
+def _mod_row_slice(vecs, row, a: int, aa: int, bb: int, target_dtype):
+    import torch
+    if torch.is_tensor(row):
+        if row.ndim > 0:
+            r = row[aa - int(a) : bb - int(a)]
+        else:
+            r = row
+        if r.device != vecs.device:
+            r = r.to(device=vecs.device, non_blocking=True)
+        return vecs[r].to(dtype=target_dtype)
+    return vecs[row].to(dtype=target_dtype)
+
+
 def _mod_scale_shift_range(h, shift, scale, segments, global_start: int):
     """Exact H3 scale/shift on an arbitrary contiguous token-row slice."""
     start = int(global_start)
@@ -80,7 +93,9 @@ def _mod_scale_shift_range(h, shift, scale, segments, global_start: int):
             continue
         la = aa - start
         lb = bb - start
-        h[la:lb].mul_(1.0 + scale[row].to(h.dtype)).add_(shift[row].to(h.dtype))
+        s_val = _mod_row_slice(scale, row, a, aa, bb, h.dtype)
+        sh_val = _mod_row_slice(shift, row, a, aa, bb, h.dtype)
+        h[la:lb].mul_(1.0 + s_val).add_(sh_val)
     return h
 
 
@@ -95,7 +110,8 @@ def _mod_gate_range(x, gate, other, segments, global_start: int):
             continue
         la = aa - start
         lb = bb - start
-        x[la:lb].addcmul_(other[la:lb], gate[row].to(x.dtype))
+        g_val = _mod_row_slice(gate, row, a, aa, bb, x.dtype)
+        x[la:lb].addcmul_(other[la:lb], g_val)
     return x
 
 

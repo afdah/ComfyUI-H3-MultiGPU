@@ -6,12 +6,26 @@ import time
 import types
 import weakref
 
+import torch
+
 from .mlp_token_parallel import clone_mlp_shared, _clone_linear_shared
 from .post_attention_island import _clone_norm_shared, _mod_scale_shift_range, _mod_gate_range
 from .rolling_helper_matrix import RollingCoverageMLPFabric
 from .critical_path import CriticalPathMLPFabric
 
 LOG = logging.getLogger("H3VM")
+
+
+def _safe_record_stream(tensor, stream):
+    if tensor is None:
+        return
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, message=".*original creation stream matches.*")
+            tensor.record_stream(stream)
+    except Exception:
+        pass
 
 
 class _CapacityAttentionHelper:
@@ -158,6 +172,16 @@ class CapacityFabric(RollingCoverageMLPFabric):
         self._step_runtime.clear()
         self._helper_rope = None
         self._helper_rope_sig = None
+        if hasattr(self, "_host_buffers"):
+            self._host_buffers.clear()
+
+    def sampling_end(self):
+        self._reset_sample()
+        import comfy.model_management as mm
+        try:
+            mm.soft_empty_cache()
+        except Exception:
+            pass
 
     # Capacity mode deliberately avoids one-ahead helper prefetch. Loading the
     # next mirrored packet while 100k-token activations are live defeats the
@@ -207,6 +231,18 @@ class CapacityFabric(RollingCoverageMLPFabric):
         self._chunked_mlp_calls = 0
         self._peak_root_free_mib = None
         self._peak_helper_free_mib = None
+        if int(step) > 0:
+            import torch
+            import comfy.model_management as mm
+            try:
+                r_free = torch.cuda.mem_get_info(self.primary)[0] / (1024 ** 2)
+                h_free = torch.cuda.mem_get_info(self.secondary)[0] / (1024 ** 2)
+                if r_free < 1536.0 or h_free < 1536.0:
+                    mm.soft_empty_cache()
+                if r_free < 800.0 or h_free < 800.0:
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
         LOG.info(
             "H3VM CAPACITY step=%d | EXACT | blocks=50 | attention=QKV_HEAD_SHARD/%s | "
             "post_mlp=TOKEN_SHARD+CHUNK rows=%d | split=%.0f/%.0f | helper_heads<=%d",
@@ -253,40 +289,69 @@ class CapacityFabric(RollingCoverageMLPFabric):
         return w, bb
 
     def _qkv_norm_rope_attention(self, attn_like, qkv, rope_freqs, transformer_options, head_count):
+        import torch
         import comfy.model_management as mm
         import comfy.quant_ops
         import comfy_kitchen
 
-        s = int(qkv.shape[0])
-        hd = int(attn_like.head_dim)
-        subinner = int(head_count) * hd
-        q, k, v = qkv.split(subinner, dim=-1)
-        v = v.view(s, int(head_count), hd)
-        q = q.view(1, s, int(head_count), hd)
-        k = k.view(1, s, int(head_count), hd)
-        qw = mm.cast_to(attn_like.q_norm.weight, device=qkv.device)
-        kw = mm.cast_to(attn_like.k_norm.weight, device=qkv.device)
-        rot = int(rope_freqs.shape[-3]) * 2
-        comfy.quant_ops.ck.rms_rope_split_half_(
-            q, k, rope_freqs, qw, kw,
-            epsilon=attn_like.q_norm.eps, rot_dim=rot,
-        )
-        q = q[0].transpose(0, 1).unsqueeze(0)
-        k = k[0].transpose(0, 1).unsqueeze(0)
-        v = v.transpose(0, 1).unsqueeze(0)
-        if self.attention_kernel == "OFFICIAL_OPTIMIZED":
-            # Same ComfyUI attention dispatcher used by official MiniMax H3.
-            # With --use-sage-attention this selects SageAttention; requesting
-            # skip_output_reshape only keeps the per-head shape required by the
-            # capacity path's chunked OutProj. The attention math itself is the
-            # official optimized path rather than H3VM's INT8 prequantized path.
-            from comfy.ldm.modules.attention import optimized_attention
-            return optimized_attention(
-                q, k, v, int(head_count), mask=None, skip_reshape=True,
-                skip_output_reshape=True, transformer_options=transformer_options,
-            )
-        packed = comfy_kitchen.prequantize_int8_attention(q, k, v, scale=None, attn_mask=None)
-        return comfy_kitchen.int8_attention_from_prequantized(packed)
+        with torch.cuda.device(qkv.device):
+            s = int(qkv.shape[0])
+            hd = int(attn_like.head_dim)
+            subinner = int(head_count) * hd
+            q, k, v = qkv.split(subinner, dim=-1)
+            v = v.view(s, int(head_count), hd)
+            q = q.view(1, s, int(head_count), hd)
+            k = k.view(1, s, int(head_count), hd)
+            qw = mm.cast_to(attn_like.q_norm.weight, device=qkv.device, dtype=qkv.dtype)
+            kw = mm.cast_to(attn_like.k_norm.weight, device=qkv.device, dtype=qkv.dtype)
+            rot = int(rope_freqs.shape[-3]) * 2
+            if rope_freqs.device != qkv.device or rope_freqs.dtype != qkv.dtype:
+                rope_freqs = rope_freqs.to(device=qkv.device, dtype=qkv.dtype)
+
+            eps = float(getattr(getattr(attn_like, "q_norm", None), "eps", 1e-5))
+            chunk_rows = int(getattr(self, "mlp_chunk_rows", 2048))
+            if s > chunk_rows:
+                for start in range(0, s, chunk_rows):
+                    end = min(s, start + chunk_rows)
+                    qc = q[:, start:end]
+                    kc = k[:, start:end]
+                    rfc = rope_freqs[:, start:end]
+                    comfy.quant_ops.ck.rms_rope_split_half_(
+                        qc, kc, rfc, qw, kw,
+                        epsilon=eps, rot_dim=rot,
+                    )
+            else:
+                comfy.quant_ops.ck.rms_rope_split_half_(
+                    q, k, rope_freqs, qw, kw,
+                    epsilon=eps, rot_dim=rot,
+                )
+            q = q[0].transpose(0, 1).unsqueeze(0)
+            k = k[0].transpose(0, 1).unsqueeze(0)
+            v = v.transpose(0, 1).unsqueeze(0)
+            if self.attention_kernel == "OFFICIAL_OPTIMIZED":
+                # Same ComfyUI attention dispatcher used by official MiniMax H3.
+                # With --use-sage-attention this selects SageAttention; requesting
+                # skip_output_reshape only keeps the per-head shape required by the
+                # capacity path's chunked OutProj. The attention math itself is the
+                # official optimized path rather than H3VM's INT8 prequantized path.
+                try:
+                    from comfy.ldm.modules.attention import optimized_attention
+                    return optimized_attention(
+                        q, k, v, int(head_count), mask=None, skip_reshape=True,
+                        skip_output_reshape=True, transformer_options=transformer_options,
+                    )
+                except Exception as e:
+                    LOG.warning("H3VM Capacity: OFFICIAL_OPTIMIZED attention failed (%r); falling back to INT8", e)
+            try:
+                packed = comfy_kitchen.prequantize_int8_attention(q, k, v, scale=None, attn_mask=None)
+                return comfy_kitchen.int8_attention_from_prequantized(packed)
+            except Exception as e:
+                LOG.warning("H3VM Capacity: comfy_kitchen INT8 attention failed (%r); falling back to optimized_attention", e)
+                from comfy.ldm.modules.attention import optimized_attention
+                return optimized_attention(
+                    q, k, v, int(head_count), mask=None, skip_reshape=True,
+                    skip_output_reshape=True, transformer_options=transformer_options,
+                )
 
     def _head_ranges(self, attn):
         heads = int(attn.heads)
@@ -408,9 +473,8 @@ class CapacityFabric(RollingCoverageMLPFabric):
         caller_stream.wait_event(re1)
         caller_stream.wait_event(returned_ready)
         out = self._chunked_outproj(attn, root_heads, returned, h.shape[0])
-        out.record_stream(caller_stream)
-        root_heads.record_stream(caller_stream)
-        returned.record_stream(caller_stream)
+        _safe_record_stream(root_heads, caller_stream)
+        _safe_record_stream(returned, caller_stream)
 
         try:
             self._attn_root_ms += float(re0.elapsed_time(re1))
@@ -537,9 +601,9 @@ class CapacityFabric(RollingCoverageMLPFabric):
         caller_stream.wait_event(o1)
         caller_stream.wait_event(returned_ready)
         out = torch.cat((local_out, returned), dim=0)
-        local_out.record_stream(caller_stream)
-        returned.record_stream(caller_stream)
-        out.record_stream(caller_stream)
+        _safe_record_stream(local_out, caller_stream)
+        _safe_record_stream(returned, caller_stream)
+        _safe_record_stream(out, caller_stream)
 
         self._pending[index] = {
             "owner": owner,
