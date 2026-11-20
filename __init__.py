@@ -121,10 +121,10 @@ class H3VMCoreEngine:
                     "INT",
                     {
                         "default": 57,
-                        "min": 50,
-                        "max": 90,
+                        "min": 5,
+                        "max": 95,
                         "step": 1,
-                        "tooltip": "Primary GPU share % (50-90) when capacity_profile is set to 'CUSTOM | Dial Exact Ratio'. Example: 57 means 57% Primary (headless) / 43% Secondary (monitor card).",
+                        "tooltip": "Primary GPU share % (5-95) when capacity_profile is set to 'CUSTOM | Dial Exact Ratio'. Example: 57 means 57% Primary (headless) / 43% Secondary (monitor card), or 43 means 43% Primary (monitor card) / 57% Secondary (headless).",
                     },
                 ),
                 "chunk_size": (
@@ -195,7 +195,7 @@ class H3VMCoreEngine:
                 capacity_attention_kernel=actual_attn_kernel,
                 capacity_mlp_chunk_rows=actual_chunk_rows,
                 capacity_outproj_chunk_rows=actual_chunk_rows,
-                custom_split_primary=max(50, min(90, int(custom_split_primary))),
+                custom_split_primary=max(5, min(95, int(custom_split_primary))),
                 public_controls=True,
             ),
         )

@@ -58,16 +58,64 @@ def test_custom_split_ratios():
     assert plan_str["capacity_helper_heads"] == 21  # round(56 * 0.38) = 21
     print("Test string 62/38 passed: MLP 62/38, helper_heads=21")
 
-    # Test clamp lower bound (e.g. 40 clamped to 50)
-    plan_low = resolve_capacity_vram_profile(
-        "CUSTOM",
+    # Test ratios below 50: 40/60 Custom Split
+    plan_40 = resolve_capacity_vram_profile(
+        "CUSTOM | Dial Exact Ratio (e.g. 57/43)",
         primary_total_gb=11.0,
         secondary_total_gb=11.0,
         custom_split_primary=40,
     )
-    assert plan_low["profile"] == "CUSTOM | 50/50 Split"
-    assert abs(plan_low["mlp_primary_fraction"] - 0.50) < 1e-4
-    print("Test clamp lower bound passed: clamped to 50/50")
+    assert plan_40["profile"] == "CUSTOM | 40/60 Split"
+    assert abs(plan_40["mlp_primary_fraction"] - 0.40) < 1e-4
+    assert plan_40["capacity_helper_heads"] == 34  # round(56 * 0.60) = 34
+    print("Test 40/60 passed: MLP 40/60, helper_heads=34")
+
+    # Test 43/57 Custom Split (mirror of 57/43)
+    plan_43 = resolve_capacity_vram_profile(
+        "CUSTOM",
+        primary_total_gb=11.0,
+        secondary_total_gb=11.0,
+        custom_split_primary=43,
+    )
+    assert plan_43["profile"] == "CUSTOM | 43/57 Split"
+    assert abs(plan_43["mlp_primary_fraction"] - 0.43) < 1e-4
+    assert plan_43["capacity_helper_heads"] == 32  # round(56 * 0.57) = 32
+    print("Test 43/57 passed: MLP 43/57, helper_heads=32")
+
+    # Test string parsing "45/55"
+    plan_str_low = resolve_capacity_vram_profile(
+        "45/55",
+        primary_total_gb=11.0,
+        secondary_total_gb=11.0,
+    )
+    assert plan_str_low["profile"] == "CUSTOM | 45/55 Split"
+    assert abs(plan_str_low["mlp_primary_fraction"] - 0.45) < 1e-4
+    assert plan_str_low["capacity_helper_heads"] == 31  # round(56 * 0.55) = 31
+    print("Test string 45/55 passed: MLP 45/55, helper_heads=31")
+
+    # Test clamp lower bound (e.g. 2 clamped to 5)
+    plan_low = resolve_capacity_vram_profile(
+        "CUSTOM",
+        primary_total_gb=11.0,
+        secondary_total_gb=11.0,
+        custom_split_primary=2,
+    )
+    assert plan_low["profile"] == "CUSTOM | 5/95 Split"
+    assert abs(plan_low["mlp_primary_fraction"] - 0.05) < 1e-4
+    assert plan_low["capacity_helper_heads"] == 53  # round(56 * 0.95) = 53
+    print("Test clamp lower bound passed: clamped to 5/95")
+
+    # Test clamp upper bound (e.g. 99 clamped to 95)
+    plan_high = resolve_capacity_vram_profile(
+        "CUSTOM",
+        primary_total_gb=11.0,
+        secondary_total_gb=11.0,
+        custom_split_primary=99,
+    )
+    assert plan_high["profile"] == "CUSTOM | 95/5 Split"
+    assert abs(plan_high["mlp_primary_fraction"] - 0.95) < 1e-4
+    assert plan_high["capacity_helper_heads"] == 3  # round(56 * 0.05) = 3
+    print("Test clamp upper bound passed: clamped to 95/5")
 
 
 if __name__ == "__main__":

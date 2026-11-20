@@ -225,10 +225,10 @@ def resolve_capacity_vram_profile(
         # User selected Custom profile mode: always use the custom_split_primary integer widget,
         # never let example text like "(e.g. 57/43)" override the user's explicit dial setting.
         p_val = int(custom_split_primary)
-        p_val = max(50, min(90, p_val))
+        p_val = max(5, min(95, p_val))
         s_val = 100 - p_val
         p_frac = p_val / 100.0
-        helper_heads = max(8, min(28, int(round(56.0 * (s_val / 100.0)))))
+        helper_heads = max(1, min(54, int(round(56.0 * (s_val / 100.0)))))
         key = f"CUSTOM | {p_val}/{s_val} Split"
         r = {
             "primary_reserve_frac": 0.35,
@@ -242,12 +242,12 @@ def resolve_capacity_vram_profile(
     elif key in _CAPACITY_VRAM_PROFILE_RATIOS:
         r = _CAPACITY_VRAM_PROFILE_RATIOS[key]
     elif custom_match:
-        # User passed a raw ratio string like "58/42" directly
+        # User passed a raw ratio string like "58/42" or "40/60" directly
         p_val = int(custom_match.group(1))
-        p_val = max(50, min(90, p_val))
+        p_val = max(5, min(95, p_val))
         s_val = 100 - p_val
         p_frac = p_val / 100.0
-        helper_heads = max(8, min(28, int(round(56.0 * (s_val / 100.0)))))
+        helper_heads = max(1, min(54, int(round(56.0 * (s_val / 100.0)))))
         key = f"CUSTOM | {p_val}/{s_val} Split"
         r = {
             "primary_reserve_frac": 0.35,
