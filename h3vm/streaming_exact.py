@@ -505,6 +505,14 @@ class StreamingExactRuntime:
         self._step_trim_ms = {0: 0.0, 1: 0.0}
         self._step_trim_mib = {0: 0.0, 1: 0.0}
         try:
+            import comfy.model_management as mm
+            mm.soft_empty_cache()
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        try:
             p = _mem_snapshot(self.primary_device)
             s = _mem_snapshot(self.secondary_device)
             LOG.info(

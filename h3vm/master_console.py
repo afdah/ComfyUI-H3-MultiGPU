@@ -230,12 +230,15 @@ def resolve_capacity_vram_profile(
         p_frac = p_val / 100.0
         helper_heads = max(1, min(54, int(round(56.0 * (s_val / 100.0)))))
         key = f"CUSTOM | {p_val}/{s_val} Split"
+        p_cache_frac = max(0.10, min(0.30, 0.25 * (p_frac / 0.55)))
+        s_cache_frac = max(0.10, min(0.35, 0.20 * ((1.0 - p_frac) / 0.45)))
+        trim_interval = 2 if p_val < 50 else 4
         r = {
             "primary_reserve_frac": 0.35,
             "secondary_reserve_frac": 0.40,
-            "primary_cache_frac": 0.25,
-            "secondary_cache_frac": 0.20,
-            "trim_interval": 4,
+            "primary_cache_frac": round(p_cache_frac, 3),
+            "secondary_cache_frac": round(s_cache_frac, 3),
+            "trim_interval": trim_interval,
             "mlp_primary_fraction": p_frac,
             "helper_heads": helper_heads,
         }
@@ -249,12 +252,15 @@ def resolve_capacity_vram_profile(
         p_frac = p_val / 100.0
         helper_heads = max(1, min(54, int(round(56.0 * (s_val / 100.0)))))
         key = f"CUSTOM | {p_val}/{s_val} Split"
+        p_cache_frac = max(0.10, min(0.30, 0.25 * (p_frac / 0.55)))
+        s_cache_frac = max(0.10, min(0.35, 0.20 * ((1.0 - p_frac) / 0.45)))
+        trim_interval = 2 if p_val < 50 else 4
         r = {
             "primary_reserve_frac": 0.35,
             "secondary_reserve_frac": 0.40,
-            "primary_cache_frac": 0.25,
-            "secondary_cache_frac": 0.20,
-            "trim_interval": 4,
+            "primary_cache_frac": round(p_cache_frac, 3),
+            "secondary_cache_frac": round(s_cache_frac, 3),
+            "trim_interval": trim_interval,
             "mlp_primary_fraction": p_frac,
             "helper_heads": helper_heads,
         }
