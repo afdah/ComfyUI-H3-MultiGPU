@@ -293,7 +293,15 @@ class CapacityFabric(RollingCoverageMLPFabric):
         )
         return w, bb
 
-    def _qkv_norm_rope_attention(self, attn_like, qkv, rope_freqs, transformer_options, head_count):
+    def _qkv_norm_rope_attention(
+        self,
+        attn_like,
+        qkv,
+        rope_freqs,
+        transformer_options,
+        head_count,
+        _qkv_box: list | None = None,
+    ):
         import torch
         import comfy.model_management as mm
         import comfy.quant_ops
@@ -333,6 +341,11 @@ class CapacityFabric(RollingCoverageMLPFabric):
             q = q[0].transpose(0, 1).unsqueeze(0).contiguous()
             k = k[0].transpose(0, 1).unsqueeze(0).contiguous()
             v = v.transpose(0, 1).unsqueeze(0).contiguous()
+            # Drop the raw packed QKV buffer (and any temporary norm/rope copies) before
+            # attention kernel scratch buffers allocate so both never coexist in VRAM.
+            if _qkv_box is not None:
+                _qkv_box.clear()
+            del qkv, qw, kw, rope_freqs
             if self.attention_kernel == "OFFICIAL_OPTIMIZED":
                 # Same ComfyUI attention dispatcher used by official MiniMax H3.
                 # With --use-sage-attention this selects SageAttention; requesting
@@ -349,13 +362,7 @@ class CapacityFabric(RollingCoverageMLPFabric):
                     LOG.warning("H3VM Capacity: OFFICIAL_OPTIMIZED attention failed (%r); falling back to INT8", e)
             try:
                 packed = comfy_kitchen.prequantize_int8_attention(q, k, v, scale=None, attn_mask=None)
-                out = comfy_kitchen.int8_attention_from_prequantized(packed)
-                cur_s = torch.cuda.current_stream(q.device)
-                for t in (getattr(packed, "q", None), getattr(packed, "k", None), getattr(packed, "v", None),
-                          getattr(packed, "q_scale", None), getattr(packed, "k_scale", None), getattr(packed, "v_scale", None)):
-                    if t is not None and isinstance(t, torch.Tensor):
-                        _safe_record_stream(t, cur_s)
-                return out
+                return comfy_kitchen.int8_attention_from_prequantized(packed)
             except Exception as e:
                 LOG.warning("H3VM Capacity: comfy_kitchen INT8 attention failed (%r); falling back to optimized_attention", e)
                 from comfy.ldm.modules.attention import optimized_attention
@@ -442,14 +449,14 @@ class CapacityFabric(RollingCoverageMLPFabric):
             rw, rb, roff = self._dense_linear_weight(attn.qkv_proj, h)
             try:
                 sw, sb = self._qkv_weight_slice(rw, rb, attn.heads, attn.head_dim, r0, r1)
-                rqkv = F.linear(h, sw, sb)
+                rqkv_box = [F.linear(h, sw, sb)]
                 del sw, sb
             finally:
                 comfy.ops.uncast_bias_weight(attn.qkv_proj, rw, rb, roff)
             root_heads = self._qkv_norm_rope_attention(
-                attn, rqkv, rope_freqs, transformer_options, r1-r0
+                attn, rqkv_box[0], rope_freqs, transformer_options, r1 - r0, _qkv_box=rqkv_box
             )
-            del rqkv
+            rqkv_box.clear()
             re1.record(root_stream)
 
         t_stage = time.perf_counter()
@@ -467,14 +474,16 @@ class CapacityFabric(RollingCoverageMLPFabric):
                 sw, sb = self._qkv_weight_slice(
                     hw, hb, helper_attn.heads, helper_attn.head_dim, h0i, h1i
                 )
-                hqkv = F.linear(remote_h, sw, sb)
+                hqkv_box = [F.linear(remote_h, sw, sb)]
                 del sw, sb
             finally:
                 comfy.ops.uncast_bias_weight(helper_attn.qkv_proj, hw, hb, hoff)
+            _safe_record_stream(remote_h, helper_stream)
+            del remote_h
             helper_heads = self._qkv_norm_rope_attention(
-                helper_attn, hqkv, helper_rope, transformer_options, h1i-h0i
+                helper_attn, hqkv_box[0], helper_rope, transformer_options, h1i - h0i, _qkv_box=hqkv_box
             )
-            del hqkv, remote_h
+            hqkv_box.clear()
             he1.record(helper_stream)
 
         t_ret = time.perf_counter()
@@ -523,6 +532,40 @@ class CapacityFabric(RollingCoverageMLPFabric):
             del h, y, part
             self._chunked_mlp_calls += 1
         return out
+
+    def _stage_post_packet(self, remote_x, mods, owner, helper, caller_stream):
+        """Stage post-attention hidden slice and modulations owner -> CPU -> helper safely across streams."""
+        import torch
+
+        host_x = self._host_buffer("capacity_stage_x", remote_x)
+        host_m = self._host_buffer("capacity_stage_mods", mods)
+        d2h = self.d2h_streams[owner]
+        h2d = self.h2d_streams[helper]
+        d0 = torch.cuda.Event(enable_timing=True)
+        d1 = torch.cuda.Event(enable_timing=True)
+        s0 = torch.cuda.Event(enable_timing=True)
+        s1 = torch.cuda.Event(enable_timing=True)
+        ready = torch.cuda.Event()
+
+        d2h.wait_stream(caller_stream)
+        with torch.cuda.device(owner), torch.cuda.stream(d2h):
+            d0.record(d2h)
+            host_x.copy_(remote_x, non_blocking=self._pinned_available)
+            host_m.copy_(mods, non_blocking=self._pinned_available)
+            d1.record(d2h)
+        _safe_record_stream(remote_x, d2h)
+        _safe_record_stream(mods, d2h)
+        d1.synchronize()
+
+        with torch.cuda.device(helper), torch.cuda.stream(h2d):
+            remote_in = torch.empty_like(remote_x, device=helper)
+            remote_mods = torch.empty_like(mods, device=helper)
+            s0.record(h2d)
+            remote_in.copy_(host_x, non_blocking=self._pinned_available)
+            remote_mods.copy_(host_m, non_blocking=self._pinned_available)
+            s1.record(h2d)
+            ready.record(h2d)
+        return remote_in, remote_mods, ready, (d0, d1, s0, s1)
 
     def execute_post(self, index: int, block, x, shift_mlp, scale_mlp, gate_mlp, mod_segments):
         """Capacity version of Dev18 post-attention row island.
@@ -573,28 +616,9 @@ class CapacityFabric(RollingCoverageMLPFabric):
             o1.record(owner_stream)
 
         mods = torch.stack((shift_mlp, scale_mlp, gate_mlp), dim=0).contiguous()
-        host_x = self._host_buffer("capacity_stage_x", remote_x)
-        host_m = self._host_buffer("capacity_stage_mods", mods)
-        d2h = self.d2h_streams[owner]
-        h2d = self.h2d_streams[helper]
-        d0 = torch.cuda.Event(enable_timing=True); d1 = torch.cuda.Event(enable_timing=True)
-        s0 = torch.cuda.Event(enable_timing=True); s1 = torch.cuda.Event(enable_timing=True)
-        ready = torch.cuda.Event()
-        d2h.wait_stream(caller_stream)
-        with torch.cuda.device(owner), torch.cuda.stream(d2h):
-            d0.record(d2h)
-            host_x.copy_(remote_x, non_blocking=self._pinned_available)
-            host_m.copy_(mods, non_blocking=self._pinned_available)
-            d1.record(d2h)
-        d1.synchronize()
-        remote_in = torch.empty_like(remote_x, device=helper)
-        remote_mods = torch.empty_like(mods, device=helper)
-        with torch.cuda.device(helper), torch.cuda.stream(h2d):
-            s0.record(h2d)
-            remote_in.copy_(host_x, non_blocking=self._pinned_available)
-            remote_mods.copy_(host_m, non_blocking=self._pinned_available)
-            s1.record(h2d)
-            ready.record(h2d)
+        remote_in, remote_mods, ready, stage_events = self._stage_post_packet(
+            remote_x, mods, owner, helper, caller_stream
+        )
 
         h0 = torch.cuda.Event(enable_timing=True)
         h1 = torch.cuda.Event(enable_timing=True)
@@ -607,6 +631,9 @@ class CapacityFabric(RollingCoverageMLPFabric):
                 segments=mod_segments, global_start=remote_start, helper_side=True,
             )
             h1.record(helper_stream)
+        _safe_record_stream(remote_in, helper_stream)
+        _safe_record_stream(remote_mods, helper_stream)
+        del remote_in, remote_mods
 
         returned, returned_ready, return_events = self._return_to_owner(remote_out, owner, helper, h1)
         caller_stream.wait_event(o1)
@@ -614,7 +641,6 @@ class CapacityFabric(RollingCoverageMLPFabric):
         out = torch.cat((local_out, returned), dim=0)
         _safe_record_stream(local_out, caller_stream)
         _safe_record_stream(returned, caller_stream)
-        _safe_record_stream(out, caller_stream)
 
         self._pending[index] = {
             "owner": owner,
@@ -623,7 +649,7 @@ class CapacityFabric(RollingCoverageMLPFabric):
             "seq": seq,
             "owner_events": (o0, o1),
             "helper_events": (h0, h1),
-            "stage_events": (d0, d1, s0, s1),
+            "stage_events": stage_events,
             "return_events": return_events,
             "shadow_enqueue_ms": 0.0,
             "primary_fraction": primary_fraction,

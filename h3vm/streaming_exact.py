@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+import weakref
 
 LOG = logging.getLogger("H3VM")
 GIB = 1024 ** 3
@@ -109,6 +110,7 @@ class StreamingExactRuntime:
 
         self.patchers = {0: None, 1: None}
         self.helper_patchers = {0: None, 1: None}
+        self._main_patcher_ref = None
         self.mlp_fabric = None
         self.owner_blocks = {
             0: [i for i in sorted(self.blocks) if self.owner_map[i] == 0],
@@ -145,11 +147,19 @@ class StreamingExactRuntime:
         self._step_event_wait_ms = 0.0
         self._step_device_barrier_ms = 0.0
 
-    def bind_patchers(self, primary_patcher, secondary_patcher, primary_helper_patcher=None, secondary_helper_patcher=None):
+    def bind_patchers(
+        self,
+        primary_patcher,
+        secondary_patcher,
+        primary_helper_patcher=None,
+        secondary_helper_patcher=None,
+        main_patcher=None,
+    ):
         self.patchers[0] = primary_patcher
         self.patchers[1] = secondary_patcher
         self.helper_patchers[0] = primary_helper_patcher
         self.helper_patchers[1] = secondary_helper_patcher
+        self._main_patcher_ref = weakref.ref(main_patcher) if main_patcher is not None else None
 
     def bind_mlp_fabric(self, fabric):
         self.mlp_fabric = fabric
@@ -295,9 +305,35 @@ class StreamingExactRuntime:
             minimum_memory_required=reserve_bytes,
             force_full_load=False,
         )
+        self._apply_vbar_watermarks(owner)
         # load_models_gpu may choose to opportunistically resident some dynamic
         # weights. Clamp that residency immediately to our explicit cache budget.
         self._trim_owner(owner, force_all=False, account=account_trim)
+
+    def _apply_vbar_watermarks(self, owner: int):
+        """Clamp active AIMDO VBAR watermarks so DynamicVRAM respects hot_cache[owner] between trims."""
+        if self.hot_cache.get(owner, 0.0) <= 0.0:
+            return
+        block_patcher = self.patchers.get(owner)
+        helper_patcher = self.helper_patchers.get(owner)
+        targets = []
+        if block_patcher is not None:
+            targets.append(block_patcher)
+        elif self.single_root and helper_patcher is not None:
+            targets.append(helper_patcher)
+
+        desired_bytes = max(512 * MIB, int(self.hot_cache[owner] * GIB))
+        for patcher in targets:
+            try:
+                get_vbar = getattr(patcher, "_vbar_get", None)
+                vbar = get_vbar() if callable(get_vbar) else None
+                set_wm = getattr(vbar, "set_watermark", None) if vbar is not None else None
+                if callable(set_wm):
+                    max_size = int(getattr(vbar, "max_size", desired_bytes) or desired_bytes)
+                    clamped = max(1, min(desired_bytes, max_size)) if max_size > 0 else desired_bytes
+                    set_wm(clamped)
+            except Exception as exc:
+                LOG.debug("H3VM VBAR watermark skipped owner=%d: %r", owner, exc)
 
     def _prepare_sidecar_background(self):
         """Prepare GPU1 behind the GPU0 critical path.
@@ -496,6 +532,64 @@ class StreamingExactRuntime:
         self._metadata_cache[owner] = out
         return out
 
+    def _purge_inactive_models(self):
+        """Evict unrelated models (such as TE/VAE from earlier pipeline nodes) before preparing islands."""
+        import comfy.model_management as mm
+        import torch
+
+        main_patcher = self._main_patcher_ref() if self._main_patcher_ref is not None else None
+        keep_patchers = [
+            p for p in (
+                main_patcher,
+                self.patchers.get(0),
+                self.patchers.get(1),
+                self.helper_patchers.get(0),
+                self.helper_patchers.get(1),
+            )
+            if p is not None
+        ]
+        keep_loaded = []
+        for lm in list(getattr(mm, "current_loaded_models", []) or []):
+            lm_model = getattr(lm, "model", None)
+            if lm_model is None:
+                continue
+            if any(
+                lm_model is kp or (callable(getattr(lm_model, "is_clone", None)) and lm_model.is_clone(kp))
+                for kp in keep_patchers
+            ):
+                keep_loaded.append(lm)
+
+        devices = []
+        for dev in (self.primary_device, self.secondary_device):
+            if dev is not None and dev not in devices:
+                devices.append(dev)
+
+        unloaded_names = []
+        for dev in devices:
+            try:
+                unloaded = mm.free_memory(1 << 40, dev, keep_loaded=keep_loaded, for_dynamic=False) or []
+                for lm in unloaded:
+                    lm_mod = getattr(lm, "model", None)
+                    inner = getattr(lm_mod, "model", lm_mod)
+                    unloaded_names.append(type(inner).__name__)
+            except Exception as exc:
+                LOG.debug("H3VM inactive model purge warning device=%s: %r", dev, exc)
+
+        if torch.cuda.is_available():
+            for dev in devices:
+                if getattr(dev, "type", None) == "cuda":
+                    try:
+                        with torch.cuda.device(dev):
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+
+        if unloaded_names:
+            LOG.info(
+                "H3VM Dev12 purged inactive models=%d (%s)",
+                len(unloaded_names), ", ".join(unloaded_names),
+            )
+
     def sampling_begin(self):
         self._sampling_generation += 1
         self._step = 0
@@ -505,13 +599,9 @@ class StreamingExactRuntime:
         self._step_trim_ms = {0: 0.0, 1: 0.0}
         self._step_trim_mib = {0: 0.0, 1: 0.0}
         try:
-            import comfy.model_management as mm
-            mm.soft_empty_cache()
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+            self._purge_inactive_models()
+        except Exception as exc:
+            LOG.debug("H3VM Dev12 pre-flight purge warning: %r", exc)
         try:
             p = _mem_snapshot(self.primary_device)
             s = _mem_snapshot(self.secondary_device)
@@ -688,11 +778,6 @@ class StreamingExactRuntime:
             with mm.cuda_device_context(dst):
                 h = block(h, t_emb_d, seg_d, rope_d, transformer_options=opts)
             torch.cuda.synchronize(dst)
-            if self.secondary_device is not None and self.secondary_device != dst:
-                try:
-                    torch.cuda.synchronize(self.secondary_device)
-                except Exception:
-                    pass
             if self.mlp_fabric is not None:
                 block_done = getattr(self.mlp_fabric, "on_block_complete", None)
                 if callable(block_done):
@@ -894,7 +979,13 @@ class StreamingExactRuntime:
         if self.hard_cleanup_after_sample:
             try:
                 import comfy.model_management as mm
+                import torch
                 mm.soft_empty_cache()
+                if torch.cuda.is_available():
+                    for dev in (self.primary_device, self.secondary_device):
+                        if dev is not None and getattr(dev, "type", None) == "cuda":
+                            with torch.cuda.device(dev):
+                                torch.cuda.empty_cache()
             except Exception as exc:
                 LOG.warning("H3VM Dev12 hard cleanup warning: %r", exc)
 
@@ -905,6 +996,7 @@ class StreamingExactRuntime:
             pass
         self.patchers = {0: None, 1: None}
         self.helper_patchers = {0: None, 1: None}
+        self._main_patcher_ref = None
         if self.mlp_fabric is not None:
             try:
                 self.mlp_fabric.close()

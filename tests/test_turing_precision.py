@@ -51,6 +51,9 @@ def test_tensor_casting():
 
 
 def test_sanitize_patcher():
+    class FP16Model:
+        manual_cast_dtype = torch.float16
+
     patcher = DummyPatcher({
         "block.0.attn.qkv_proj.weight": [
             (1.0, (torch.randn(8, 8, dtype=torch.bfloat16), torch.randn(8, 8, dtype=torch.float32)), 1.0, None, None)
@@ -59,10 +62,12 @@ def test_sanitize_patcher():
             (0.8, torch.randn(16, 16, dtype=torch.bfloat16), 1.0, None, None)
         ]
     })
+    patcher.model = FP16Model()
 
     converted = sanitize_model_precision(patcher, force=True)
     assert converted == 3
-    assert patcher.force_cast_weights == torch.float16
+    # ComfyUI expects boolean force_cast_weights (setting torch.dtype disables MixedPrecisionOps quantized Linear!)
+    assert isinstance(patcher.force_cast_weights, bool) and patcher.force_cast_weights is False
 
     # Verify all tensors are now FP16
     qkv_patch = patcher.patches["block.0.attn.qkv_proj.weight"][0]
@@ -73,8 +78,47 @@ def test_sanitize_patcher():
     assert mlp_patch[1].dtype == torch.float16
 
 
+def test_sanitize_repairs_nonbool_force_cast_weights_and_respects_bf16():
+    patcher = DummyPatcher({
+        "block.0.weight": [(1.0, torch.randn(4, 4, dtype=torch.bfloat16), 1.0, None, None)]
+    })
+    patcher.force_cast_weights = torch.float16  # Simulate legacy bug
+
+    class BF16Model:
+        manual_cast_dtype = torch.bfloat16
+
+    patcher.model = BF16Model()
+    converted = sanitize_model_precision(patcher, force=True)
+    assert converted == 0, "Should respect BF16 model compute dtype instead of casting LoRA to FP16"
+    assert isinstance(patcher.force_cast_weights, bool) and patcher.force_cast_weights is False
+    assert patcher.patches["block.0.weight"][0][1].dtype == torch.bfloat16
+
+
+def test_mixed_precision_ops_quant_eligible_after_sanitize():
+    comfy_root = ROOT.parents[1]
+    if not (comfy_root / "comfy").is_dir():
+        return
+    if str(comfy_root) not in sys.path:
+        sys.path.insert(0, str(comfy_root))
+    import comfy.ops as ops
+
+    patcher = DummyPatcher({})
+    patcher.force_cast_weights = torch.float16
+    mp_ops = ops.mixed_precision_ops()
+    lin = mp_ops.Linear(4, 4, bias=False)
+    lin.comfy_force_cast_weights = patcher.force_cast_weights
+    # With the old bug (dtype assigned to force_cast_weights), _use_quantized condition evaluates False:
+    assert bool(getattr(lin, "comfy_force_cast_weights", False)) is True
+
+    sanitize_model_precision(patcher, force=True)
+    lin.comfy_force_cast_weights = patcher.force_cast_weights
+    assert not getattr(lin, "comfy_force_cast_weights", False)
+
+
 if __name__ == "__main__":
     test_turing_detection()
     test_tensor_casting()
     test_sanitize_patcher()
+    test_sanitize_repairs_nonbool_force_cast_weights_and_respects_bf16()
+    test_mixed_precision_ops_quant_eligible_after_sanitize()
     print("Turing precision tests passed successfully!")

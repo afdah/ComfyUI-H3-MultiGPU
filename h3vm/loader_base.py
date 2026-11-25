@@ -2005,6 +2005,7 @@ def build_h3_streaming_exact_turbo(*, unet_name: str, turbo_lora_name: str, turb
     runtime.bind_patchers(
         primary_island_patcher, secondary_island_patcher,
         primary_mlp_helper_patcher, secondary_mlp_helper_patcher,
+        main_patcher=patcher,
     )
 
     attention = None

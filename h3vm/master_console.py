@@ -209,6 +209,38 @@ _CAPACITY_PROFILE_ALIASES = {
 }
 
 
+def _custom_split_ratios(p_val: int) -> tuple[str, dict]:
+    """Derive Capacity profile ratios from primary compute/head percentage [5..95]."""
+    p_val = max(5, min(95, int(p_val)))
+    s_val = 100 - p_val
+    p_frac = p_val / 100.0
+    helper_heads = max(1, min(54, int(round(56.0 * (s_val / 100.0)))))
+    key = f"CUSTOM | {p_val}/{s_val} Split"
+    if p_val < 55:
+        # When offloading below 55% primary, give primary higher reserve + tighter hot cache
+        # (including its VBAR watermark) while letting secondary keep more resident blocks.
+        p_reserve_frac = min(0.65, 0.35 + (55 - p_val) * 0.008)
+        s_reserve_frac = max(0.20, 0.40 - (55 - p_val) * 0.004)
+        p_cache_frac = max(0.06, min(0.25, 0.25 * (p_frac / 0.55)))
+        s_cache_frac = max(0.15, min(0.42, 0.20 + (55 - p_val) * 0.005))
+        trim_interval = 1 if p_val <= 35 else (2 if p_val < 50 else 4)
+    else:
+        p_reserve_frac = 0.35
+        s_reserve_frac = 0.40
+        p_cache_frac = max(0.10, min(0.30, 0.25 * (p_frac / 0.55)))
+        s_cache_frac = max(0.10, min(0.35, 0.20 * ((1.0 - p_frac) / 0.45)))
+        trim_interval = 4
+    return key, {
+        "primary_reserve_frac": round(p_reserve_frac, 3),
+        "secondary_reserve_frac": round(s_reserve_frac, 3),
+        "primary_cache_frac": round(p_cache_frac, 3),
+        "secondary_cache_frac": round(s_cache_frac, 3),
+        "trim_interval": trim_interval,
+        "mlp_primary_fraction": p_frac,
+        "helper_heads": helper_heads,
+    }
+
+
 def resolve_capacity_vram_profile(
     profile: str,
     primary_total_gb: float,
@@ -220,50 +252,16 @@ def resolve_capacity_vram_profile(
     key = _CAPACITY_PROFILE_ALIASES.get(raw, raw)
 
     is_custom = "CUSTOM" in key.upper() or "CUSTOM" in raw.upper()
-    custom_match = re.search(r"(\d{2})\s*[/_:-]\s*(\d{2})", raw)
+    custom_match = re.search(r"(?<!\d)(\d{1,2})\s*[/_:-]\s*(\d{1,2})(?!\d)", raw)
     if is_custom:
         # User selected Custom profile mode: always use the custom_split_primary integer widget,
         # never let example text like "(e.g. 57/43)" override the user's explicit dial setting.
-        p_val = int(custom_split_primary)
-        p_val = max(5, min(95, p_val))
-        s_val = 100 - p_val
-        p_frac = p_val / 100.0
-        helper_heads = max(1, min(54, int(round(56.0 * (s_val / 100.0)))))
-        key = f"CUSTOM | {p_val}/{s_val} Split"
-        p_cache_frac = max(0.10, min(0.30, 0.25 * (p_frac / 0.55)))
-        s_cache_frac = max(0.10, min(0.35, 0.20 * ((1.0 - p_frac) / 0.45)))
-        trim_interval = 2 if p_val < 50 else 4
-        r = {
-            "primary_reserve_frac": 0.35,
-            "secondary_reserve_frac": 0.40,
-            "primary_cache_frac": round(p_cache_frac, 3),
-            "secondary_cache_frac": round(s_cache_frac, 3),
-            "trim_interval": trim_interval,
-            "mlp_primary_fraction": p_frac,
-            "helper_heads": helper_heads,
-        }
+        key, r = _custom_split_ratios(custom_split_primary)
     elif key in _CAPACITY_VRAM_PROFILE_RATIOS:
         r = _CAPACITY_VRAM_PROFILE_RATIOS[key]
     elif custom_match:
-        # User passed a raw ratio string like "58/42" or "40/60" directly
-        p_val = int(custom_match.group(1))
-        p_val = max(5, min(95, p_val))
-        s_val = 100 - p_val
-        p_frac = p_val / 100.0
-        helper_heads = max(1, min(54, int(round(56.0 * (s_val / 100.0)))))
-        key = f"CUSTOM | {p_val}/{s_val} Split"
-        p_cache_frac = max(0.10, min(0.30, 0.25 * (p_frac / 0.55)))
-        s_cache_frac = max(0.10, min(0.35, 0.20 * ((1.0 - p_frac) / 0.45)))
-        trim_interval = 2 if p_val < 50 else 4
-        r = {
-            "primary_reserve_frac": 0.35,
-            "secondary_reserve_frac": 0.40,
-            "primary_cache_frac": round(p_cache_frac, 3),
-            "secondary_cache_frac": round(s_cache_frac, 3),
-            "trim_interval": trim_interval,
-            "mlp_primary_fraction": p_frac,
-            "helper_heads": helper_heads,
-        }
+        # User passed a raw ratio string like "5/95", "58/42", or "40/60" directly
+        key, r = _custom_split_ratios(int(custom_match.group(1)))
     else:
         if key not in _CAPACITY_VRAM_PROFILE_RATIOS:
             raise ValueError(f"Unknown Capacity profile: {profile}")

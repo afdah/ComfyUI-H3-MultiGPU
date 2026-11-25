@@ -66,14 +66,38 @@ def cast_tensors_to_native_precision(item, target_dtype: torch.dtype = torch.flo
     return item, 0
 
 
-def sanitize_patcher_precision(patcher, device: str | torch.device | None = None, force: bool = False) -> int:
-    """Inspect and cast all attached LoRA patches to native FP16 on Turing sm_75.
+def _infer_target_dtype(patcher) -> torch.dtype:
+    """Return the patcher model's preferred compute dtype, defaulting to FP16."""
+    model = getattr(patcher, "model", None)
+    if model is not None:
+        manual_cast = getattr(model, "manual_cast_dtype", None)
+        if isinstance(manual_cast, torch.dtype):
+            return manual_cast
+        model_dtype_fn = getattr(model, "model_dtype", None)
+        if callable(model_dtype_fn):
+            try:
+                inferred = model_dtype_fn()
+                if isinstance(inferred, torch.dtype) and inferred in (torch.float16, torch.bfloat16, torch.float32):
+                    return inferred
+            except Exception:
+                pass
+    return torch.float16
 
-    Returns the number of patched tensors converted.
+
+def sanitize_patcher_precision(patcher, device: str | torch.device | None = None, force: bool = False) -> int:
+    """Inspect and cast attached LoRA patches to native FP16 on Turing sm_75 when appropriate.
+
+    Respects models configured to compute in BF16/FP32 rather than blindly
+    converting their patches to FP16. Returns the number of patched tensors
+    converted.
     """
     if patcher is None:
         return 0
     if not force and not is_turing_or_older(device):
+        return 0
+
+    target_dtype = _infer_target_dtype(patcher)
+    if target_dtype != torch.float16:
         return 0
 
     patches = getattr(patcher, "patches", {}) or {}
@@ -88,7 +112,7 @@ def sanitize_patcher_precision(patcher, device: str | torch.device | None = None
             if isinstance(entry, (tuple, list)) and len(entry) >= 2:
                 # Standard ComfyUI patch entry: (strength_patch, weight_data, strength_model, offset, function)
                 v = entry[1]
-                casted_v, count = cast_tensors_to_native_precision(v, torch.float16)
+                casted_v, count = cast_tensors_to_native_precision(v, target_dtype)
                 if count > 0:
                     total_converted += count
                     entry = list(entry)
@@ -108,18 +132,18 @@ def sanitize_patcher_precision(patcher, device: str | torch.device | None = None
 
 
 def sanitize_model_precision(patcher, device: str | torch.device | None = None, force: bool = False) -> int:
-    """Ensure base model parameters and LoRAs on Turing do not run BF16 emulated operations."""
+    """Ensure Turing LoRA patches match native FP16 when appropriate without corrupting force_cast_weights."""
     if patcher is None:
         return 0
     if not force and not is_turing_or_older(device):
         return 0
 
-    converted = sanitize_patcher_precision(patcher, device=device, force=force)
+    # Repair non-bool force_cast_weights if set by older code; ComfyUI expects a bool here
+    # (setting a torch.dtype makes bool(comfy_force_cast_weights) True and disables quantized kernels).
+    if hasattr(patcher, "force_cast_weights") and not isinstance(getattr(patcher, "force_cast_weights"), bool):
+        try:
+            setattr(patcher, "force_cast_weights", False)
+        except Exception:
+            pass
 
-    # Ensure force_cast_weights is set to FP16 so any dynamic casting goes directly to native FP16
-    try:
-        setattr(patcher, "force_cast_weights", torch.float16)
-    except Exception:
-        pass
-
-    return converted
+    return sanitize_patcher_precision(patcher, device=device, force=force)

@@ -91,7 +91,23 @@ def test_custom_split_ratios():
     assert plan_str_low["profile"] == "CUSTOM | 45/55 Split"
     assert abs(plan_str_low["mlp_primary_fraction"] - 0.45) < 1e-4
     assert plan_str_low["capacity_helper_heads"] == 31  # round(56 * 0.55) = 31
-    print("Test string 45/55 passed: MLP 45/55, helper_heads=31")
+    assert plan_str_low["single_root_trim_interval"] == 2
+    assert plan_str_low["primary_runtime_reserve_gb"] > plan_57["primary_runtime_reserve_gb"]
+    assert plan_str_low["primary_hot_cache_gb"] < plan_57["primary_hot_cache_gb"]
+    assert plan_str_low["secondary_hot_cache_gb"] > plan_57["secondary_hot_cache_gb"]
+    print("Test string 45/55 passed: MLP 45/55, helper_heads=31, asymmetric reserve/cache verified")
+
+    # Test single-digit string parsing "5/95"
+    plan_str_5 = resolve_capacity_vram_profile(
+        "5/95",
+        primary_total_gb=14.56,
+        secondary_total_gb=14.56,
+    )
+    assert plan_str_5["profile"] == "CUSTOM | 5/95 Split"
+    assert abs(plan_str_5["mlp_primary_fraction"] - 0.05) < 1e-4
+    assert plan_str_5["capacity_helper_heads"] == 53
+    assert plan_str_5["single_root_trim_interval"] == 1
+    print("Test string 5/95 passed: single-digit regex works")
 
     # Test clamp lower bound (e.g. 2 clamped to 5)
     plan_low = resolve_capacity_vram_profile(
